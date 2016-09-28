@@ -68,3 +68,4 @@ dist/
 nupic.egg-info/
 nupic/*py_region.*
 temp/
+**.suo
