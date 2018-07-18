@@ -1,6 +1,6 @@
 # ----------------------------------------------------------------------
 # Numenta Platform for Intelligent Computing (NuPIC)
-# Copyright (C) 2015, Numenta, Inc.  Unless you have an agreement
+# Copyright (C) 2016, Numenta, Inc.  Unless you have an agreement
 # with Numenta, Inc., for a separate license for this software code, the
 # following terms and conditions apply:
 #
@@ -148,12 +148,13 @@ if __name__ == "__main__":
     zip_safe=False,
     extras_require = {
       # Default requirement based on system type
-      #":platform_system=='Linux' or platform_system=='Darwin'":
-      #  ["pycapnp==0.5.8"],
+      ":platform_system=='Linux' or platform_system=='Darwin'":
+        ["pycapnp==0.6.3"],
 
       # Superseded by platform_system-conditional requirement, but keeping
       # empty extra for compatibility as recommended by setuptools doc.
       "capnp": [],
+      "viz": ["networkx", "matplotlib", "pygraphviz"]
     },
     description="Numenta Platform for Intelligent Computing",
     author="Numenta",

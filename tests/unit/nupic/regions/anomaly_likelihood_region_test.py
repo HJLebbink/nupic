@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # ----------------------------------------------------------------------
 # Numenta Platform for Intelligent Computing (NuPIC)
 # Copyright (C) 2016, Numenta, Inc.  Unless you have purchased from
@@ -31,10 +30,10 @@ try:
 except ImportError:
   capnp = None
 if capnp:
-  from nupic.regions.AnomalyLikelihoodRegion_capnp import\
-    AnomalyLikelihoodRegionProto
+  from nupic.algorithms.anomaly_likelihood_capnp import\
+    AnomalyLikelihoodProto as AnomalyLikelihoodRegionProto
 
-from nupic.regions.AnomalyLikelihoodRegion import AnomalyLikelihoodRegion
+from nupic.regions.anomaly_likelihood_region import AnomalyLikelihoodRegion
 from nupic.algorithms.anomaly_likelihood import AnomalyLikelihood
 from pkg_resources import resource_filename
 
@@ -90,8 +89,13 @@ class AnomalyLikelihoodRegionTest(unittest.TestCase):
     anomalyLikelihoodRegion1 = AnomalyLikelihoodRegion()
     inputs = AnomalyLikelihoodRegion.getSpec()['inputs']
     outputs = AnomalyLikelihoodRegion.getSpec()['outputs']
+    parameters = AnomalyLikelihoodRegion.getSpec()['parameters']
 
-    for _ in xrange(0, 6):
+    # Make sure to calculate distribution by passing the probation period
+    learningPeriod = parameters['learningPeriod']['defaultValue']
+    reestimationPeriod = parameters['reestimationPeriod']['defaultValue']
+    probation = learningPeriod + reestimationPeriod
+    for _ in xrange(0, probation + 1):
       inputs['rawAnomalyScore'] = numpy.array([random.random()])
       inputs['metricValue'] = numpy.array([random.random()])
       anomalyLikelihoodRegion1.compute(inputs, outputs)
@@ -111,7 +115,8 @@ class AnomalyLikelihoodRegionTest(unittest.TestCase):
     anomalyLikelihoodRegion2 = AnomalyLikelihoodRegion.read(proto2)
     self.assertEqual(anomalyLikelihoodRegion1, anomalyLikelihoodRegion2)
 
-    for _ in xrange(6, 500):
+    window = parameters['historicWindowSize']['defaultValue']
+    for _ in xrange(0, window + 1):
       inputs['rawAnomalyScore'] = numpy.array([random.random()])
       inputs['metricValue'] = numpy.array([random.random()])
       anomalyLikelihoodRegion1.compute(inputs, outputs)

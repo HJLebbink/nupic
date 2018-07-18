@@ -21,9 +21,10 @@
 
 """
 This module analyzes and estimates the distribution of averaged anomaly scores
-from a given model. Given a new anomaly score `s`, estimates `P(score >= s)`.
+from a given model. Given a new anomaly score ``s``, estimates
+``P(score >= s)``.
 
-The number `P(score >= s)` represents the likelihood of the current state of
+The number ``P(score >= s)`` represents the likelihood of the current state of
 predictability. For example, a likelihood of 0.01 or 1% means we see this much
 predictability about one out of every 100 records. The number is not as unusual
 as it seems. For records that arrive every minute, this means once every hour
@@ -31,44 +32,118 @@ and 40 minutes. A likelihood of 0.0001 or 0.01% means we see it once out of
 10,000 records, or about once every 7 days.
 
 USAGE
------
++++++
 
-There are two ways to use the code: using the AnomalyLikelihood helper class or
-using the raw individual functions.
-
-
-Helper Class
-------------
-The helper class AnomalyLikelihood is the easiest to use.  To use it simply
-create an instance and then feed it successive anomaly scores:
-
-anomalyLikelihood = AnomalyLikelihood()
-while still_have_data:
-  # Get anomaly score from model
-
-  # Compute probability that an anomaly has ocurred
-  anomalyProbability = anomalyLikelihood.anomalyProbability(
-      value, anomalyScore, timestamp)
+There are two ways to use the code: using the
+:class:`.anomaly_likelihood.AnomalyLikelihood` helper class or using the raw
+individual functions :func:`~.anomaly_likelihood.estimateAnomalyLikelihoods` and
+:func:`~.anomaly_likelihood.updateAnomalyLikelihoods`.
 
 
-Raw functions
--------------
+Low-Level Function Usage
+++++++++++++++++++++++++
 
-There are two lower level functions, estimateAnomalyLikelihoods and
-updateAnomalyLikelihoods. The details of these are described below.
+There are two primary interface routines.
+
+- :func:`~.anomaly_likelihood.estimateAnomalyLikelihoods`: batch routine, called
+  initially and once in a while
+- :func:`~.anomaly_likelihood.updateAnomalyLikelihoods`: online routine, called
+  for every new data point
+
+Initially:
+
+.. code-block:: python
+
+   likelihoods, avgRecordList, estimatorParams = \\
+     estimateAnomalyLikelihoods(metric_data)
+
+Whenever you get new data:
+
+.. code-block:: python
+
+   likelihoods, avgRecordList, estimatorParams = \\
+     updateAnomalyLikelihoods(data2, estimatorParams)
+
+And again (make sure you use the new estimatorParams returned in the above call
+to updateAnomalyLikelihoods!).
+
+.. code-block:: python
+
+   likelihoods, avgRecordList, estimatorParams = \\
+     updateAnomalyLikelihoods(data3, estimatorParams)
+
+Every once in a while update estimator with a lot of recent data.
+
+.. code-block:: python
+
+   likelihoods, avgRecordList, estimatorParams = \\
+     estimateAnomalyLikelihoods(lots_of_metric_data)
+
+
+PARAMS
+++++++
+
+The parameters dict returned by the above functions has the following
+structure. Note: the client does not need to know the details of this.
+
+::
+
+ {
+   "distribution":               # describes the distribution
+     {
+       "name": STRING,           # name of the distribution, such as 'normal'
+       "mean": SCALAR,           # mean of the distribution
+       "variance": SCALAR,       # variance of the distribution
+
+       # There may also be some keys that are specific to the distribution
+     },
+
+   "historicalLikelihoods": []   # Contains the last windowSize likelihood
+                                 # values returned
+
+   "movingAverage":              # stuff needed to compute a rolling average
+                                 # of the anomaly scores
+     {
+       "windowSize": SCALAR,     # the size of the averaging window
+       "historicalValues": [],   # list with the last windowSize anomaly
+                                 # scores
+       "total": SCALAR,          # the total of the values in historicalValues
+     },
+
+ }
 
 """
 
 import collections
 import math
+import numbers
 import numpy
 
+from nupic.serializable import Serializable
 from nupic.utils import MovingAverage
 
+try:
+  import capnp
+except ImportError:
+  capnp = None
+if capnp:
+  from nupic.algorithms.anomaly_likelihood_capnp import AnomalyLikelihoodProto
 
-class AnomalyLikelihood(object):
+class AnomalyLikelihood(Serializable):
   """
-  Helper class for running anomaly likelihood computation.
+  Helper class for running anomaly likelihood computation. To use it simply
+  create an instance and then feed it successive anomaly scores:
+
+  .. code-block:: python
+
+      anomalyLikelihood = AnomalyLikelihood()
+      while still_have_data:
+        # Get anomaly score from model
+
+        # Compute probability that an anomaly has ocurred
+        anomalyProbability = anomalyLikelihood.anomalyProbability(
+            value, anomalyScore, timestamp)
+
   """
 
 
@@ -85,25 +160,25 @@ class AnomalyLikelihood(object):
     claLearningPeriod and learningPeriod are specifying the same variable,
     although claLearningPeriod is a deprecated name for it.
 
-    @param learningPeriod (claLeraningPeriod: deprecated) - (int) the number of
+    :param learningPeriod: (claLearningPeriod: deprecated) - (int) the number of
       iterations required for the algorithm to learn the basic patterns in the
       dataset and for the anomaly score to 'settle down'. The default is based
       on empirical observations but in reality this could be larger for more
       complex domains. The downside if this is too large is that real anomalies
       might get ignored and not flagged.
 
-    @param estimationSamples - (int) the number of reasonable anomaly scores
+    :param estimationSamples: (int) the number of reasonable anomaly scores
       required for the initial estimate of the Gaussian. The default of 100
       records is reasonable - we just need sufficient samples to get a decent
       estimate for the Gaussian. It's unlikely you will need to tune this since
       the Gaussian is re-estimated every 10 iterations by default.
 
-    @param historicWindowSize - (int) size of sliding window of historical
+    :param historicWindowSize: (int) size of sliding window of historical
       data points to maintain for periodic reestimation of the Gaussian. Note:
       the default of 8640 is based on a month's worth of history at 5-minute
       intervals.
 
-    @param reestimationPeriod - (int) how often we re-estimate the Gaussian
+    :param reestimationPeriod: (int) how often we re-estimate the Gaussian
       distribution. The ideal is to re-estimate every iteration but this is a
       performance hit. In general the system is not very sensitive to this
       number as long as it is small relative to the total number of records
@@ -118,7 +193,7 @@ class AnomalyLikelihood(object):
 
 
     if claLearningPeriod != None:
-      print "claLearningPeriod is deprecated, use learningPeriod instead."
+      print("claLearningPeriod is deprecated, use learningPeriod instead.")
       self._learningPeriod = claLearningPeriod
     else:
       self._learningPeriod = learningPeriod
@@ -172,10 +247,10 @@ class AnomalyLikelihood(object):
     into account as well so we return the `learningPeriod` minus the number
     shifted out.
 
-    @param numIngested - (int) number of data points that have been added to the
+    :param numIngested - (int) number of data points that have been added to the
       sliding window of historical data points.
-    @param windowSize - (int) size of sliding window of historical data points.
-    @param learningPeriod - (int) the number of iterations required for the
+    :param windowSize - (int) size of sliding window of historical data points.
+    :param learningPeriod - (int) the number of iterations required for the
       algorithm to learn the basic patterns in the dataset and for the anomaly
       score to 'settle down'.
     """
@@ -184,13 +259,17 @@ class AnomalyLikelihood(object):
 
 
   @classmethod
+  def getSchema(cls):
+    return AnomalyLikelihoodProto
+
+  @classmethod
   def read(cls, proto):
     """ capnp deserialization method for the anomaly likelihood object
 
-    @param proto (Object) capnp proto object specified in
-                          nupic.regions.AnomalyLikelihoodRegion.capnp
+    :param proto: (Object) capnp proto object specified in
+                          nupic.regions.anomaly_likelihood.capnp
 
-    @return (Object) the deserialized AnomalyLikelihood object
+    :returns: (Object) the deserialized AnomalyLikelihood object
     """
     # pylint: disable=W0212
     anomalyLikelihood = object.__new__(cls)
@@ -202,26 +281,23 @@ class AnomalyLikelihood(object):
       anomalyLikelihood._historicalScores.append((i, score.value,
                                                   score.anomalyScore))
     if proto.distribution.name: # is "" when there is no distribution.
-      anomalyLikelihood._distribution = {}
-      anomalyLikelihood._distribution["name"] = proto.distribution.name
-      anomalyLikelihood._distribution["mean"] = proto.distribution.mean
-      anomalyLikelihood._distribution["variance"] = proto.distribution.variance
-      anomalyLikelihood._distribution["stdev"] = proto.distribution.stdev
+      anomalyLikelihood._distribution = dict()
+      anomalyLikelihood._distribution['distribution'] = dict()
+      anomalyLikelihood._distribution['distribution']["name"] = proto.distribution.name
+      anomalyLikelihood._distribution['distribution']["mean"] = proto.distribution.mean
+      anomalyLikelihood._distribution['distribution']["variance"] = proto.distribution.variance
+      anomalyLikelihood._distribution['distribution']["stdev"] = proto.distribution.stdev
 
       anomalyLikelihood._distribution["movingAverage"] = {}
-      anomalyLikelihood._distribution["movingAverage"]["windowSize"] =\
-        proto.distribution.movingAverage.windowSize
+      anomalyLikelihood._distribution["movingAverage"]["windowSize"] = proto.distribution.movingAverage.windowSize
       anomalyLikelihood._distribution["movingAverage"]["historicalValues"] = []
       for value in proto.distribution.movingAverage.historicalValues:
-        anomalyLikelihood._distribution["movingAverage"]["historicalValues"]\
-          .append(value)
-      anomalyLikelihood._distribution["movingAverage"]["total"] =\
-        proto.distribution.movingAverage.total
+        anomalyLikelihood._distribution["movingAverage"]["historicalValues"].append(value)
+      anomalyLikelihood._distribution["movingAverage"]["total"] = proto.distribution.movingAverage.total
 
       anomalyLikelihood._distribution["historicalLikelihoods"] = []
       for likelihood in proto.distribution.historicalLikelihoods:
-        anomalyLikelihood._distribution["historicalLikelihoods"].append(
-          likelihood)
+        anomalyLikelihood._distribution["historicalLikelihoods"].append(likelihood)
     else:
       anomalyLikelihood._distribution = None
 
@@ -236,9 +312,10 @@ class AnomalyLikelihood(object):
   def write(self, proto):
     """ capnp serialization method for the anomaly likelihood object
 
-    @param proto (Object) capnp proto object specified in
-                          nupic.regions.AnomalyLikelihoodRegion.capnp
+    :param proto: (Object) capnp proto object specified in
+                          nupic.regions.anomaly_likelihood.capnp
     """
+
     proto.iteration = self._iteration
 
     pHistScores = proto.init('historicalScores', len(self._historicalScores))
@@ -249,15 +326,12 @@ class AnomalyLikelihood(object):
       record.anomalyScore = float(anomalyScore)
 
     if self._distribution:
-      proto.distribution.name = self._distribution["distributionParams"]["name"]
-      proto.distribution.mean = self._distribution["distributionParams"]["mean"]
-      proto.distribution.variance = self._distribution["distributionParams"]\
-        ["variance"]
-      proto.distribution.stdev = self._distribution["distributionParams"]\
-        ["stdev"]
+      proto.distribution.name = self._distribution["distribution"]["name"]
+      proto.distribution.mean = float(self._distribution["distribution"]["mean"])
+      proto.distribution.variance = float(self._distribution["distribution"]["variance"])
+      proto.distribution.stdev = float(self._distribution["distribution"]["stdev"])
 
-      proto.distribution.movingAverage.windowSize = self._distribution\
-        ["movingAverage"]["windowSize"]
+      proto.distribution.movingAverage.windowSize = float(self._distribution["movingAverage"]["windowSize"])
 
       historicalValues = self._distribution["movingAverage"]["historicalValues"]
       pHistValues = proto.distribution.movingAverage.init(
@@ -265,10 +339,8 @@ class AnomalyLikelihood(object):
       for i, value in enumerate(historicalValues):
         pHistValues[i] = float(value)
 
-      proto.distribution.movingAverage.historicalValues = self._distribution\
-        ["movingAverage"]["historicalValues"]
-      proto.distribution.movingAverage.total = self._distribution\
-        ["movingAverage"]["total"]
+      #proto.distribution.movingAverage.historicalValues = self._distribution["movingAverage"]["historicalValues"]
+      proto.distribution.movingAverage.total = float(self._distribution["movingAverage"]["total"])
 
       historicalLikelihoods = self._distribution["historicalLikelihoods"]
       pHistLikelihoods = proto.distribution.init("historicalLikelihoods",
@@ -288,12 +360,12 @@ class AnomalyLikelihood(object):
     an anomaly given the historical distribution of anomaly scores. The closer
     the number is to 1, the higher the chance it is an anomaly.
 
-    @param value - the current metric ("raw") input value, eg. "orange", or
+    :param value: the current metric ("raw") input value, eg. "orange", or
                    '21.2' (deg. Celsius), ...
-    @param anomalyScore - the current anomaly score
-    @param timestamp - (optional) timestamp of the ocurrence,
+    :param anomalyScore: the current anomaly score
+    :param timestamp: [optional] timestamp of the ocurrence,
                        default (None) results in using iteration step.
-    @return the anomalyLikelihood for this record.
+    :returns: the anomalyLikelihood for this record.
     """
     if timestamp is None:
       timestamp = self._iteration
@@ -328,70 +400,6 @@ class AnomalyLikelihood(object):
 
     return likelihood
 
-
-#
-# USAGE FOR LOW-LEVEL FUNCTIONS
-# -----------------------------
-#
-# There are two primary interface routines:
-#
-# estimateAnomalyLikelihoods: batch routine, called initially and once in a
-#                                while
-# updateAnomalyLikelihoods: online routine, called for every new data point
-#
-# 1. Initially::
-#
-#    likelihoods, avgRecordList, estimatorParams = \
-# estimateAnomalyLikelihoods(metric_data)
-#
-# 2. Whenever you get new data::
-#
-#    likelihoods, avgRecordList, estimatorParams = \
-# updateAnomalyLikelihoods(data2, estimatorParams)
-#
-# 3. And again (make sure you use the new estimatorParams returned in the above
-#   call to updateAnomalyLikelihoods!)::
-#
-#    likelihoods, avgRecordList, estimatorParams = \
-# updateAnomalyLikelihoods(data3, estimatorParams)
-#
-# 4. Every once in a while update estimator with a lot of recent data::
-#
-#    likelihoods, avgRecordList, estimatorParams = \
-# estimateAnomalyLikelihoods(lots_of_metric_data)
-#
-#
-# PARAMS
-# ~~~~~~
-#
-# The parameters dict returned by the above functions has the following
-# structure. Note: the client does not need to know the details of this.
-#
-# ::
-#
-#  {
-#    "distribution":               # describes the distribution
-#      {
-#        "name": STRING,           # name of the distribution, such as 'normal'
-#        "mean": SCALAR,           # mean of the distribution
-#        "variance": SCALAR,       # variance of the distribution
-#
-#        # There may also be some keys that are specific to the distribution
-#      },
-#
-#    "historicalLikelihoods": []   # Contains the last windowSize likelihood
-#                                  # values returned
-#
-#    "movingAverage":              # stuff needed to compute a rolling average
-#                                  # of the anomaly scores
-#      {
-#        "windowSize": SCALAR,     # the size of the averaging window
-#        "historicalValues": [],   # list with the last windowSize anomaly
-#                                  # scores
-#        "total": SCALAR,          # the total of the values in historicalValues
-#      },
-#
-#  }
 
 
 def estimateAnomalyLikelihoods(anomalyScores,
@@ -440,10 +448,10 @@ def estimateAnomalyLikelihoods(anomalyScores,
 
   """
   if verbosity > 1:
-    print "In estimateAnomalyLikelihoods."
-    print "Number of anomaly scores:", len(anomalyScores)
-    print "Skip records=", skipRecords
-    print "First 20:", anomalyScores[0:min(20, len(anomalyScores))]
+    print("In estimateAnomalyLikelihoods.")
+    print("Number of anomaly scores:", len(anomalyScores))
+    print("Skip records=", skipRecords)
+    print("First 20:", anomalyScores[0:min(20, len(anomalyScores))])
 
   if len(anomalyScores) == 0:
     raise ValueError("Must have at least one anomalyScore")
@@ -462,23 +470,25 @@ def estimateAnomalyLikelihoods(anomalyScores,
   else:
     distributionParams = estimateNormal(dataValues[skipRecords:])
 
-    # HACK ALERT! The CLA model currently does not handle constant metric values
-    # very well (time of day encoder changes sometimes lead to unstable SDR's
-    # even though the metric is constant). Until this is resolved, we explicitly
-    # detect and handle completely flat metric values by reporting them as not
-    # anomalous.
+    # HACK ALERT! The HTMPredictionModel currently does not handle constant
+    # metric values very well (time of day encoder changes sometimes lead to
+    # unstable SDR's even though the metric is constant). Until this is
+    # resolved, we explicitly detect and handle completely flat metric values by
+    # reporting them as not anomalous.
     s = [r[1] for r in aggRecordList]
-    metricValues = numpy.array(s)
-    metricDistribution = estimateNormal(metricValues[skipRecords:],
-                                        performLowerBoundCheck=False)
+    # Only do this if the values are numeric
+    if all([isinstance(r[1], numbers.Number) for r in aggRecordList]):
+      metricValues = numpy.array(s)
+      metricDistribution = estimateNormal(metricValues[skipRecords:],
+                                          performLowerBoundCheck=False)
 
-    if metricDistribution["variance"] < 1.5e-5:
-      distributionParams = nullDistribution(verbosity = verbosity)
+      if metricDistribution["variance"] < 1.5e-5:
+        distributionParams = nullDistribution(verbosity = verbosity)
 
   # Estimate likelihoods based on this distribution
   likelihoods = numpy.array(dataValues, dtype=float)
   for i, s in enumerate(dataValues):
-    likelihoods[i] = normalProbability(s, distributionParams)
+    likelihoods[i] = tailProbability(s, distributionParams)
 
   # Filter likelihood values
   filteredLikelihoods = numpy.array(
@@ -496,12 +506,12 @@ def estimateAnomalyLikelihoods(anomalyScores,
   }
 
   if verbosity > 1:
-    print "Discovered params="
-    print params
-    print "Number of likelihoods:", len(likelihoods)
-    print "First 20 likelihoods:", (
-      filteredLikelihoods[0:min(20, len(filteredLikelihoods))] )
-    print "leaving estimateAnomalyLikelihoods"
+    print("Discovered params=")
+    print(params)
+    print("Number of likelihoods:", len(likelihoods))
+    print("First 20 likelihoods:", (
+      filteredLikelihoods[0:min(20, len(filteredLikelihoods))] ))
+    print("leaving estimateAnomalyLikelihoods")
 
 
   return (filteredLikelihoods, aggRecordList, params)
@@ -541,10 +551,10 @@ def updateAnomalyLikelihoods(anomalyScores,
 
   """
   if verbosity > 3:
-    print "In updateAnomalyLikelihoods."
-    print "Number of anomaly scores:", len(anomalyScores)
-    print "First 20:", anomalyScores[0:min(20, len(anomalyScores))]
-    print "Params:", params
+    print("In updateAnomalyLikelihoods.")
+    print("Number of anomaly scores:", len(anomalyScores))
+    print("First 20:", anomalyScores[0:min(20, len(anomalyScores))])
+    print("Params:", params)
 
   if len(anomalyScores) == 0:
     raise ValueError("Must have at least one anomalyScore")
@@ -553,7 +563,7 @@ def updateAnomalyLikelihoods(anomalyScores,
     raise ValueError("'params' is not a valid params structure")
 
   # For backward compatibility.
-  if not params.has_key("historicalLikelihoods"):
+  if "historicalLikelihoods" not in params:
     params["historicalLikelihoods"] = [1.0]
 
   # Compute moving averages of these new scores using the previous values
@@ -569,7 +579,7 @@ def updateAnomalyLikelihoods(anomalyScores,
       MovingAverage.compute(historicalValues, total, v[2], windowSize)
     )
     aggRecordList[i] = newAverage
-    likelihoods[i]   = normalProbability(newAverage, params["distribution"])
+    likelihoods[i]   = tailProbability(newAverage, params["distribution"])
 
   # Filter the likelihood values. First we prepend the historical likelihoods
   # to the current set. Then we filter the values.  We peel off the likelihoods
@@ -593,9 +603,9 @@ def updateAnomalyLikelihoods(anomalyScores,
   assert len(newParams["historicalLikelihoods"]) <= windowSize
 
   if verbosity > 3:
-    print "Number of likelihoods:", len(likelihoods)
-    print "First 20 likelihoods:", likelihoods[0:min(20, len(likelihoods))]
-    print "Leaving updateAnomalyLikelihoods."
+    print("Number of likelihoods:", len(likelihoods))
+    print("First 20 likelihoods:", likelihoods[0:min(20, len(likelihoods))])
+    print("Leaving updateAnomalyLikelihoods.")
 
   return (likelihoods, aggRecordList, newParams)
 
@@ -658,7 +668,7 @@ def _anomalyScoreMovingAverage(anomalyScores,
     # Skip (but log) records without correct number of entries
     if not isinstance(record, (list, tuple)) or len(record) != 3:
       if verbosity >= 1:
-        print "Malformed record:", record
+        print("Malformed record:", record)
       continue
 
     avg, historicalValues, total = (
@@ -668,8 +678,8 @@ def _anomalyScoreMovingAverage(anomalyScores,
     averagedRecordList.append( [record[0], record[1], avg] )
 
     if verbosity > 2:
-      print "Aggregating input record:", record
-      print "Result:", [record[0], record[1], avg]
+      print("Aggregating input record:", record)
+      print("Result:", [record[0], record[1], avg])
 
   return averagedRecordList, historicalValues, total
 
@@ -719,7 +729,7 @@ def nullDistribution(verbosity=0):
       between 0 and 1 pretty likely.
   """
   if verbosity>0:
-    print "Returning nullDistribution"
+    print("Returning nullDistribution")
   return {
     "name": "normal",
     "mean": 0.5,
@@ -729,11 +739,13 @@ def nullDistribution(verbosity=0):
 
 
 
-def normalProbability(x, distributionParams):
+def tailProbability(x, distributionParams):
   """
-  Given the normal distribution specified by the mean and standard deviation in
-  distributionParams, return the probability of getting samples > x.
-  This is the Q-function: the tail probability of the normal distribution.
+  Given the normal distribution specified by the mean and standard deviation
+  in distributionParams, return the probability of getting samples further
+  from the mean. For values above the mean, this is the probability of getting
+  samples > x and for values below the mean, the probability of getting
+  samples < x. This is the Q-function: the tail probability of the normal distribution.
 
   :param distributionParams: dict with 'mean' and 'stdev' of the distribution
   """
@@ -743,7 +755,7 @@ def normalProbability(x, distributionParams):
   if x < distributionParams["mean"]:
     # Gaussian is symmetrical around mean, so flip to get the tail probability
     xp = 2 * distributionParams["mean"] - x
-    return 1.0 - normalProbability(xp, distributionParams)
+    return tailProbability(xp, distributionParams)
 
   # Calculate the Q function with the complementary error function, explained
   # here: http://www.gaussianwaves.com/2012/07/q-function-and-error-functions
@@ -760,13 +772,13 @@ def isValidEstimatorParams(p):
   """
   if not isinstance(p, dict):
     return False
-  if not p.has_key("distribution"):
+  if "distribution" not in p:
     return False
-  if not p.has_key("movingAverage"):
+  if "movingAverage" not in p:
     return False
   dist = p["distribution"]
-  if not (dist.has_key("mean") and dist.has_key("name")
-          and dist.has_key("variance") and dist.has_key("stdev")):
+  if not ("mean" in dist and "name" in dist
+          and "variance" in dist and "stdev" in dist):
     return False
 
   return True
